@@ -1136,6 +1136,13 @@ bool vfio_config_quirk_setup(VFIOPCIDevice *vdev, Error **errp)
     return true;
 }
 
+void vfio_config_quirk_exit(VFIOPCIDevice *vdev)
+{
+#ifdef CONFIG_VFIO_IGD
+    vfio_igd_quirk_exit(vdev);
+#endif
+}
+
 void vfio_vga_quirk_setup(VFIOPCIDevice *vdev)
 {
     vfio_vga_probe_ati_3c3_quirk(vdev);

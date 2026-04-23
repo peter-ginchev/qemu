@@ -18,6 +18,7 @@
 #include "hw/boards.h"
 #include "hw/hw.h"
 #include "hw/nvram/fw_cfg.h"
+#include "hw/i386/e820_memory_layout.h"
 #include "pci.h"
 #include "pci-quirks.h"
 #include "trace.h"
@@ -98,6 +99,9 @@ static int igd_gen(VFIOPCIDevice *vdev)
     case 0x4600:    /* Alder Lake */
     case 0xA700:    /* Raptor Lake */
         return 12;
+    case 0x7D00:    /* Meteor Lake / Arrow Lake-H/U/S (LMEMBAR stolen memory) */
+    case 0xB600:    /* Arrow Lake-S DT2 (e.g. 0xB640) */
+        return 14;
     }
 
     /*
@@ -421,6 +425,14 @@ static bool vfio_pci_igd_override_gms(int gen, uint32_t gms, uint32_t *gmch)
 
     if (gen == -1) {
         error_report("x-igd-gms is not supported on this device");
+    } else if (gen == 14) {
+        /*
+         * On Xe-LPG (MTL/ARL) the stolen window is set up by the host
+         * BIOS via host-bridge BGSM/TSEGMB and identity-mapped into the
+         * guest.
+         */
+        error_report("x-igd-gms is not supported on Xe-LPG (MTL/ARL); "
+                     "stolen size is set by host BIOS");
     } else if (gen < 8) {
         if (gms <= 0x10) {
             *gmch &= ~(IGD_GMCH_GEN6_GMS_MASK << IGD_GMCH_GEN6_GMS_SHIFT);
@@ -469,9 +481,11 @@ void vfio_probe_igd_bar0_quirk(VFIOPCIDevice *vdev, int nr)
 
     /* Only on IGD Gen6-12 device needs quirks in BAR 0 */
     gen = igd_gen(vdev);
-    if (gen < 6) {
+    if (gen < 6 || gen > 12) {
+        info_report("IGD: bar0_quirk: device_id=0x%04x gen=%d, skipping quirk", vdev->device_id, gen);
         return;
     }
+    info_report("IGD: bar0_quirk: device_id=0x%04x gen=%d", vdev->device_id, gen);
 
     if (vdev->igd_gms) {
         ggc_quirk = vfio_quirk_alloc(1);
@@ -510,6 +524,134 @@ void vfio_probe_igd_bar0_quirk(VFIOPCIDevice *vdev, int nr)
     QLIST_INSERT_HEAD(&vdev->bars[nr].quirks, bdsm_quirk, next);
 }
 
+struct vfio_igd_dsm_info {
+    uint64_t base;
+    uint64_t size;
+};
+
+/*
+ * Setup identity mapping of the host IGD stolen memory (DSM) region into
+ * the guest at the same GPA the host BIOS programmed for the physical
+ * device. Returns:
+ *   0       - success: vdev->igd_dsm_* is initialized and a RAM-device
+ *             MemoryRegion was overlaid at the host stolen GPA.
+ *   -ENODEV - kernel does not advertise the IGD DSM vfio region (older
+ *             host kernel or older IGD generation); not an error.
+ *   <0      - hard error; *errp set.
+ */
+static int vfio_pci_igd_dsm_setup(VFIOPCIDevice *vdev, Error **errp)
+{
+    struct vfio_region_info *info = NULL;
+    struct vfio_igd_dsm_info dsm_info;
+    uint64_t dsm_info_base, dsm_info_size;
+    ssize_t nread;
+    void *ptr;
+    int ret;
+
+    ret = vfio_device_get_region_info_type(&vdev->vbasedev,
+                VFIO_REGION_TYPE_PCI_VENDOR_TYPE | PCI_VENDOR_ID_INTEL,
+                VFIO_REGION_SUBTYPE_INTEL_IGD_DSM, &info);
+    if (ret) {
+        /*
+         * -ENODEV here means the host kernel is older than the one that
+         * exposes the IGD DSM vfio sub-region, or this device does not
+         * have a Xe-LPG-style stolen window. The caller decides whether
+         * that is fatal.
+         */
+        return -ENODEV;
+    }
+
+    info_report("IGD: dsm_setup: region index=%u offset=0x%" PRIx64
+                " size=0x%" PRIx64 " flags=0x%x",
+                info->index, (uint64_t)info->offset,
+                (uint64_t)info->size, info->flags);
+
+    if (!(info->flags & VFIO_REGION_INFO_FLAG_MMAP)) {
+        error_setg(errp, "IGD DSM vfio region is not mmappable");
+        return -EINVAL;
+    }
+
+    nread = pread(vdev->vbasedev.fd, &dsm_info, sizeof(dsm_info),
+                  info->offset);
+    if (nread != sizeof(dsm_info)) {
+        error_setg_errno(errp, errno, "failed to read IGD DSM info");
+        return -EIO;
+    }
+
+    dsm_info_base = le64_to_cpu(dsm_info.base);
+    dsm_info_size = le64_to_cpu(dsm_info.size);
+
+    info_report("IGD: dsm_setup: kernel reports base=0x%" PRIx64
+                " size=0x%" PRIx64, dsm_info_base, dsm_info_size);
+
+    if (!dsm_info_base || !dsm_info_size) {
+        error_setg(errp, "invalid IGD DSM base/size from kernel "
+                         "(base=0x%" PRIx64 " size=0x%" PRIx64 ")",
+                   dsm_info_base, dsm_info_size);
+        return -EINVAL;
+    }
+
+    ptr = mmap(NULL, dsm_info_size,
+               PROT_READ | PROT_WRITE,
+               MAP_SHARED,
+               vdev->vbasedev.fd,
+               info->offset);
+    if (ptr == MAP_FAILED) {
+        error_setg_errno(errp, errno,
+                         "failed to mmap IGD DSM VFIO region");
+        return -EIO;
+    }
+
+    /*
+     * Reserve the identity-mapped DSM range in the guest E820 so the OS
+     * does not allocate over it. OVMF maps E820 RESERVED entries
+     * to EFI_RESOURCE_MEMORY_RESERVED HOBs, which surface as
+     * EfiReservedMemoryType in the UEFI memory map.
+     */
+    e820_add_entry(dsm_info_base, dsm_info_size, E820_RESERVED);
+
+    vdev->igd_dsm_ptr = ptr;
+    vdev->igd_dsm_size = dsm_info_size;
+
+    memory_region_init_ram_device_ptr(&vdev->igd_dsm_mr,
+                                      OBJECT(vdev),
+                                      "vfio-igd-dsm",
+                                      dsm_info_size,
+                                      ptr);
+
+    /*
+     * Identity placement: guest GPA == host stolen base.
+     *
+     * Overlay (priority 1) on top of normal guest RAM at that GPA so
+     * accesses from guest firmware / GOP / driver land on the vfio-mapped
+     * host stolen pages. The OS is told this is reserved via the E820
+     * entry added above, so it does not reuse it for general allocations.
+     */
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        dsm_info_base,
+                                        &vdev->igd_dsm_mr,
+                                        1);
+
+    info_report("IGD: dsm_setup: DSM identity-mapped at GPA=0x%" PRIx64
+                " size=0x%" PRIx64 " (overlay priority=1)",
+                dsm_info_base, dsm_info_size);
+    return 0;
+}
+
+static void vfio_pci_igd_dsm_exit(VFIOPCIDevice *vdev)
+{
+    if (!vdev->igd_dsm_ptr) {
+        return;
+    }
+    info_report("IGD: dsm_exit: tearing down DSM overlay size=0x%" PRIx64,
+                vdev->igd_dsm_size);
+    memory_region_del_subregion(get_system_memory(), &vdev->igd_dsm_mr);
+    object_unparent(OBJECT(&vdev->igd_dsm_mr));
+    munmap(vdev->igd_dsm_ptr, vdev->igd_dsm_size);
+    vdev->igd_dsm_ptr = NULL;
+    vdev->igd_dsm_size = 0;
+}
+
 static bool vfio_pci_igd_config_quirk(VFIOPCIDevice *vdev, Error **errp)
 {
     struct vfio_region_info *opregion = NULL;
@@ -534,6 +676,8 @@ static bool vfio_pci_igd_config_quirk(VFIOPCIDevice *vdev, Error **errp)
 
     gen = igd_gen(vdev);
     gmch = vfio_pci_read_config(pdev, IGD_GMCH, 4);
+    info_report("IGD: config_quirk: device_id=0x%04x gen=%d gmch=0x%08x",
+                vdev->device_id, gen, gmch);
 
     /*
      * For backward compatibility, enable legacy mode when
@@ -635,7 +779,7 @@ static bool vfio_pci_igd_config_quirk(VFIOPCIDevice *vdev, Error **errp)
         pci_set_long(vdev->emulated_config_bits + IGD_GMCH, ~0);
     }
 
-    if (gen > 0) {
+    if (gen > 0 && gen < 14) {
         gms_size = igd_stolen_memory_size(gen, gmch);
 
         /* BDSM is read-write, emulated. BIOS needs to be able to write it */
@@ -648,6 +792,25 @@ static bool vfio_pci_igd_config_quirk(VFIOPCIDevice *vdev, Error **errp)
             pci_set_quad(pdev->wmask + IGD_BDSM_GEN11, ~0);
             pci_set_quad(vdev->emulated_config_bits + IGD_BDSM_GEN11, ~0);
         }
+    }
+    else if (gen == 14) {
+        /*
+         * Xe-LPG (MTL/ARL): the device cannot function without the
+         * host-DSM identity mapping, so any failure - including the
+         * "older host kernel" -ENODEV - is fatal.
+         */
+        ret = vfio_pci_igd_dsm_setup(vdev, &err);
+        if (ret == -ENODEV) {
+            error_setg(&err,
+                       "Xe-LPG IGD passthrough requires a host kernel "
+                       "that exposes the IGD DSM vfio sub-region "
+                       "(VFIO_REGION_SUBTYPE_INTEL_IGD_DSM)");
+            goto error;
+        } else if (ret) {
+            goto error;
+        }
+        info_report("IGD: config_quirk: gen14 device; set up "
+                    "host-DSM identity mapping");
     }
 
     /*
@@ -662,6 +825,8 @@ static bool vfio_pci_igd_config_quirk(VFIOPCIDevice *vdev, Error **errp)
     *bdsm_size = cpu_to_le64(gms_size);
     fw_cfg_add_file(fw_cfg_find(), "etc/igd-bdsm-size",
                     bdsm_size, sizeof(*bdsm_size));
+    info_report("IGD: config_quirk: etc/igd-bdsm-size=%" PRIu64
+                " bytes (%" PRIu64 " MB)", gms_size, gms_size / MiB);
 
     trace_vfio_pci_igd_bdsm_enabled(vdev->vbasedev.name, (gms_size / MiB));
 
@@ -724,4 +889,9 @@ bool vfio_probe_igd_config_quirk(VFIOPCIDevice *vdev, Error **errp)
     }
 
     return vfio_pci_igd_config_quirk(vdev, errp);
+}
+
+void vfio_igd_quirk_exit(VFIOPCIDevice *vdev)
+{
+    vfio_pci_igd_dsm_exit(vdev);
 }
